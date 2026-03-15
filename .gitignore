@@ -1,0 +1,69 @@
+# =========================
+# Keil uVision
+# =========================
+
+# Output folders
+Objects/
+Listings/
+*.axf
+*.elf
+*.hex
+*.bin
+*.map
+*.o
+*.d
+*.crf
+
+# Keil project user files
+*.uvoptx
+*.uvguix.*
+*.uvgui.*
+*.scvd
+*.bak
+*.dep
+
+# Flash / debug
+*.flm
+*.dbgconf
+*.ini
+
+# ARM Compiler temporary
+*.sct~
+*.lnp
+*.iex
+*.htm
+*.plg
+
+# =========================
+# STM32
+# =========================
+*.ioc
+*.launch
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env/
+
+# =========================
+# OS
+# =========================
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# =========================
+# VSCode (si lo usas)
+# =========================
+.vscode/
+
+# =========================
+# Build systems
+# =========================
+build/
+Debug/
+Release/

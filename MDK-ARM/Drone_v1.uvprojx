@@ -564,6 +564,11 @@
                 </FileArmAds>
               </FileOption>
             </File>
+            <File>
+              <FileName>nrf24.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\nrf24.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
