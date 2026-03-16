@@ -413,6 +413,11 @@
               <FileType>1</FileType>
               <FilePath>..\Core\Src\mpu9250.c</FilePath>
             </File>
+            <File>
+              <FileName>nrf24.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\nrf24.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -563,11 +568,6 @@
                   </Cads>
                 </FileArmAds>
               </FileOption>
-            </File>
-            <File>
-              <FileName>nrf24.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\nrf24.c</FilePath>
             </File>
           </Files>
         </Group>
