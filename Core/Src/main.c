@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Horus: MPU9250 -> nRF24 -> Raspberry Pi (IMU 200 Hz + CMD ACK)
+  * @brief          : Horus Link - MPU9250 + Motors + NRF24 (ACK commands) robust
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -15,6 +15,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdbool.h>
 /* USER CODE END Includes */
 
 /* Private variables ---------------------------------------------------------*/
@@ -26,36 +27,62 @@ UART_HandleTypeDef huart2;
 /* USER CODE BEGIN PV */
 static MPU9250_t mpu;
 static NRF24_t nrf;
-static char txbuf[128];
 
 /* RF MUST match Pi */
 static const uint8_t RF_ADDR[5] = {'D','R','O','N','E'};
 static const uint8_t RF_CH = 110;
 
-/* Timing */
+/* Rates */
 static const uint32_t IMU_HZ = 200;
-static const uint32_t IMU_PERIOD_MS = 5;
-static uint32_t next_ms = 0;
-static uint8_t seq8 = 0;
+static const uint32_t IMU_PERIOD_MS = 5;      // 200 Hz
+static const uint32_t HB_PERIOD_MS  = 50;     // 20 Hz heartbeat when IMU off/busy
+
+/* Link / state */
+static uint8_t  imu_enable = 1;
+static uint8_t  armed = 0;
+static uint16_t thr_us = 1000;
+static uint32_t last_cmd_ms = 0;
+static const uint32_t FAILSAFE_MS = 500;      // disarm if no cmd refresh
+
+/* Sequence */
+static uint8_t tx_seq = 0;
+static uint8_t cmd_echo = 0;
+static uint8_t ping_echo = 0;
+
+/* Calibration state machine (non-blocking) */
+static uint8_t cal_busy = 0;
+static uint16_t cal_samples_target = 800;
+static uint16_t cal_count = 0;
+static int32_t gxs=0,gys=0,gzs=0;
+static int32_t axs=0,ays=0,azs=0;
+static uint32_t cal_next_ms = 0;
+static const uint32_t CAL_SAMPLE_PERIOD_MS = 5;  // same as your old delay
+
+/* Schedulers */
+static uint32_t next_imu_ms = 0;
+static uint32_t next_hb_ms  = 0;
 
 /* Packet types */
-#define PKT_IMU  0xA1
-#define PKT_CMD  0xB1
+#define PKT_TELEM   0xA1
+#define PKT_CMD     0xB1
 
-/* IMU status bits */
+/* Status bits */
 #define ST_MPU_OK     (1U<<0)
 #define ST_ACCEL_OK   (1U<<1)
 #define ST_ARMED      (1U<<2)
-#define ST_LASTCMD_OK (1U<<3)
+#define ST_CAL_BUSY   (1U<<3)
+#define ST_IMU_EN     (1U<<4)
+#define ST_FAILSAFE   (1U<<5)
 
-/* CMD flags (Pi -> STM via ACK payload) */
-#define CMD_CAL_GYRO   (1U<<0)
-#define CMD_CAL_ACCEL  (1U<<1)
-#define CMD_ARM        (1U<<2)
-#define CMD_DISARM     (1U<<3)
-#define CMD_SET_THR    (1U<<4)
-#define CMD_SET_MOTOR  (1U<<5)
-#define CMD_ESTOP      (1U<<6)
+/* Command flags */
+#define CMD_ARM        (1U<<0)
+#define CMD_DISARM     (1U<<1)
+#define CMD_ESTOP      (1U<<2)
+#define CMD_SET_THR    (1U<<3)
+#define CMD_SET_MOTOR  (1U<<4)
+#define CMD_IMU_EN     (1U<<5)
+#define CMD_CAL_ALL    (1U<<6)
+#define CMD_PING       (1U<<7)
 
 /* Motor mask bits */
 #define M1_BIT (1U<<0)
@@ -63,38 +90,32 @@ static uint8_t seq8 = 0;
 #define M3_BIT (1U<<2)
 #define M4_BIT (1U<<3)
 
-/* Control state */
-static volatile uint8_t armed = 0;     // por seguridad: arranca desarmado
-static uint16_t m_us[4] = {1000,1000,1000,1000};
-static uint16_t thr_us = 1000;
-
-static volatile uint8_t imu_enable = 1;    // la Pi puede apagar transmisión
-static volatile uint8_t last_cmd_seq = 0;
-static volatile uint8_t last_cmd_seen = 0;
-
 #pragma pack(push,1)
+/* Pi -> STM (ACK payload) : 12 bytes */
 typedef struct {
-  uint8_t  type;      // 0xA1
-  uint8_t  seq;       // 0..255
-  uint32_t t_ms;      // HAL_GetTick()
-  int16_t  ax_mg, ay_mg, az_mg;          // accel mg
-  int16_t  gx_dps10, gy_dps10, gz_dps10; // gyro 0.1 dps
-  uint16_t status;    // bits
-} ImuPkt;
-
-/* 12 bytes CMD (de tu Python) */
-typedef struct {
-  uint8_t  type;       // 0xB1
-  uint8_t  cmd_seq;
-  uint16_t flags;
-  uint16_t thr_us;
-  uint8_t  motor_mask;
-  uint16_t motor_us;
-  uint8_t  imu_enable;
-  uint8_t  r0;
-  uint8_t  r1;
+  uint8_t  type;        // 0xB1
+  uint8_t  cmd_seq;     // increments each command
+  uint16_t flags;       // CMD_*
+  uint16_t thr_us;      // 1000..2000
+  uint8_t  motor_mask;  // M1..M4 bits
+  uint16_t motor_us;    // 1000..2000
+  uint8_t  imu_enable;  // 0/1
+  uint8_t  ping_id;     // increments when user 'ping'
 } CmdPkt;
+
+/* STM -> Pi : 24 bytes (<=32) */
+typedef struct {
+  uint8_t  type;        // 0xA1
+  uint8_t  tx_seq;      // increments always
+  uint32_t t_ms;
+  int16_t  ax_mg, ay_mg, az_mg;
+  int16_t  gx_dps10, gy_dps10, gz_dps10;
+  uint16_t status;
+  uint8_t  cmd_echo;    // last cmd_seq applied/accepted
+  uint8_t  ping_echo;   // last ping_id seen
+} TelemPkt;
 #pragma pack(pop)
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -107,21 +128,35 @@ static void MX_USART2_UART_Init(void);
 
 /* USER CODE BEGIN PFP */
 static void uart_print(const char *s);
+
+static inline uint16_t clamp_u16(uint16_t v, uint16_t lo, uint16_t hi);
 static inline int16_t clamp_i16(int32_t v);
-static inline uint16_t clamp_u16(uint16_t v);
 
-static void pwm_apply(void);
-static void set_all(uint16_t us);
-static void set_mask(uint8_t mask, uint16_t us);
+static void motors_start(void);
+static void motors_write_all(uint16_t us);
+static void motors_write_mask(uint8_t mask, uint16_t us);
+static void disarm_now(uint8_t set_failsafe_flag);
 
-static void handle_cmd(const CmdPkt *c, uint8_t len);
-static void send_imu_and_poll_cmd(uint32_t now_ms);
+static bool mpu_read_raw_gyro(int16_t *gx, int16_t *gy, int16_t *gz);
+static bool mpu_read_raw_accel(int16_t *ax, int16_t *ay, int16_t *az);
+static void cal_start(uint16_t samples);
+static void cal_step(uint32_t now_ms);
+
+static void build_send_telem(uint32_t now_ms);
+static void handle_cmd(const CmdPkt *c);
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
 static void uart_print(const char *s)
 {
   HAL_UART_Transmit(&huart2, (uint8_t*)s, (uint16_t)strlen(s), 200);
+}
+
+static inline uint16_t clamp_u16(uint16_t v, uint16_t lo, uint16_t hi)
+{
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
 }
 
 static inline int16_t clamp_i16(int32_t v)
@@ -131,149 +166,215 @@ static inline int16_t clamp_i16(int32_t v)
   return (int16_t)v;
 }
 
-static inline uint16_t clamp_u16(uint16_t v)
+static void motors_start(void)
 {
-  if (v < 1000) return 1000;
-  if (v > 2000) return 2000;
-  return v;
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
+  __HAL_TIM_MOE_ENABLE(&htim1);
 }
 
-/* --- PWM helpers --- */
-static void pwm_apply(void)
+static void motors_write_all(uint16_t us)
 {
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, armed ? m_us[0] : 1000);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, armed ? m_us[1] : 1000);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, armed ? m_us[2] : 1000);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, armed ? m_us[3] : 1000);
+  us = clamp_u16(us, 1000, 2000);
+  if (!armed) us = 1000;
+
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, us);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, us);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, us);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, us);
 }
 
-static void set_all(uint16_t us)
+static void motors_write_mask(uint8_t mask, uint16_t us)
 {
-  us = clamp_u16(us);
-  thr_us = us;
-  m_us[0] = m_us[1] = m_us[2] = m_us[3] = us;
-  pwm_apply();
+  us = clamp_u16(us, 1000, 2000);
+  if (!armed) us = 1000;
+
+  if (mask & M1_BIT) __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, us);
+  if (mask & M2_BIT) __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, us);
+  if (mask & M3_BIT) __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, us);
+  if (mask & M4_BIT) __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, us);
 }
 
-static void set_mask(uint8_t mask, uint16_t us)
+static void disarm_now(uint8_t set_failsafe_flag)
 {
-  us = clamp_u16(us);
-  if(mask & M1_BIT) m_us[0] = us;
-  if(mask & M2_BIT) m_us[1] = us;
-  if(mask & M3_BIT) m_us[2] = us;
-  if(mask & M4_BIT) m_us[3] = us;
-  pwm_apply();
+  (void)set_failsafe_flag;
+  armed = 0;
+  thr_us = 1000;
+  motors_write_all(1000);
 }
 
-/* --- CMD handler --- */
-static void handle_cmd(const CmdPkt *c, uint8_t len)
+/* --- raw reads for non-blocking calibration --- */
+static bool mpu_read_raw_gyro(int16_t *gx, int16_t *gy, int16_t *gz)
 {
-  if (!c || len < sizeof(CmdPkt)) return;
-  if (c->type != PKT_CMD) return;
+  uint8_t d[6];
+  if (HAL_I2C_Mem_Read(&hi2c1, mpu.i2c_addr, 0x43, 1, d, 6, 100) != HAL_OK) return false;
+  *gx = (int16_t)((d[0]<<8) | d[1]);
+  *gy = (int16_t)((d[2]<<8) | d[3]);
+  *gz = (int16_t)((d[4]<<8) | d[5]);
+  return true;
+}
 
-  last_cmd_seq = c->cmd_seq;
-  last_cmd_seen = 1;
+static bool mpu_read_raw_accel(int16_t *ax, int16_t *ay, int16_t *az)
+{
+  uint8_t d[6];
+  if (HAL_I2C_Mem_Read(&hi2c1, mpu.i2c_addr, 0x3B, 1, d, 6, 100) != HAL_OK) return false;
+  *ax = (int16_t)((d[0]<<8) | d[1]);
+  *ay = (int16_t)((d[2]<<8) | d[3]);
+  *az = (int16_t)((d[4]<<8) | d[5]);
+  return true;
+}
 
-  /* imu enable controls TX of IMU packets */
-  imu_enable = (c->imu_enable != 0);
+static void cal_start(uint16_t samples)
+{
+  cal_busy = 1;
+  cal_samples_target = samples;
+  cal_count = 0;
+  gxs=gys=gzs=0;
+  axs=ays=azs=0;
+  cal_next_ms = HAL_GetTick();
+  // Por seguridad: desarmar y dejar 1000us
+  disarm_now(0);
+}
 
+static void cal_step(uint32_t now_ms)
+{
+  if (!cal_busy) return;
+  if ((int32_t)(now_ms - cal_next_ms) < 0) return;
+  cal_next_ms += CAL_SAMPLE_PERIOD_MS;
+
+  int16_t gx,gy,gz, ax,ay,az;
+  if (!mpu_read_raw_gyro(&gx,&gy,&gz)) return;
+  if (!mpu_read_raw_accel(&ax,&ay,&az)) return;
+
+  gxs += gx; gys += gy; gzs += gz;
+  axs += ax; ays += ay; azs += az;
+  cal_count++;
+
+  if (cal_count >= cal_samples_target) {
+    // Gyro offsets (deg/s) using 131 LSB/dps
+    float gxo = ((float)gxs / (float)cal_count) / 131.0f;
+    float gyo = ((float)gys / (float)cal_count) / 131.0f;
+    float gzo = ((float)gzs / (float)cal_count) / 131.0f;
+
+    // Accel offsets (g) using 16384 LSB/g
+    float axo = ((float)axs / (float)cal_count) / 16384.0f;
+    float ayo = ((float)ays / (float)cal_count) / 16384.0f;
+    float azo = ((float)azs / (float)cal_count) / 16384.0f;
+
+    mpu.Gx_offset = gxo;
+    mpu.Gy_offset = gyo;
+    mpu.Gz_offset = gzo;
+
+    mpu.Ax_offset = axo;
+    mpu.Ay_offset = ayo;
+    // Z debe ser +1g en reposo
+    mpu.Az_offset = azo - 1.0f;
+
+    cal_busy = 0;
+  }
+}
+
+static void handle_cmd(const CmdPkt *c)
+{
+  // Validación básica
+  if (!c || c->type != PKT_CMD) return;
+
+  last_cmd_ms = HAL_GetTick();
+  cmd_echo = c->cmd_seq;
+
+  // Ping
+  if (c->flags & CMD_PING) {
+    ping_echo = c->ping_id;
+  }
+
+  // IMU enable
+  if (c->flags & CMD_IMU_EN) {
+    imu_enable = (c->imu_enable ? 1 : 0);
+  }
+
+  // ESTOP
   if (c->flags & CMD_ESTOP) {
-    armed = 0;
-    set_all(1000);
+    disarm_now(0);
     return;
   }
 
-  if (c->flags & CMD_DISARM) {
-    armed = 0;
-    set_all(1000);
+  // CAL (gyro+acc juntos)
+  if (c->flags & CMD_CAL_ALL) {
+    cal_start(800); // fijo por ahora
+    return;
   }
 
-  if (c->flags & CMD_ARM) {
-    armed = 1;
-    pwm_apply();
-  }
-
-  if (c->flags & CMD_SET_THR) {
-    set_all(c->thr_us);
-  }
-
-  if (c->flags & CMD_SET_MOTOR) {
-    set_mask(c->motor_mask, c->motor_us);
-  }
-
-  if (c->flags & CMD_CAL_GYRO) {
-    uart_print("CAL_GYRO...\r\n");
-    (void)MPU9250_Calibrate_Gyro(&hi2c1, &mpu, 800);
-    uart_print("CAL_GYRO DONE\r\n");
-  }
-
-  if (c->flags & CMD_CAL_ACCEL) {
-    uart_print("CAL_ACCEL...\r\n");
-    (void)MPU9250_Calibrate_Accel(&hi2c1, &mpu, 800);
-    uart_print("CAL_ACCEL DONE\r\n");
-  }
-}
-
-/* --- IMU TX + ACK read --- */
-static void send_imu_and_poll_cmd(uint32_t now_ms)
-{
-  ImuPkt p;
-  memset(&p, 0, sizeof(p));
-  p.type = PKT_IMU;
-  p.seq  = seq8++;
-  p.t_ms = now_ms;
-
-  uint16_t st_bits = 0;
-
-  MPU_Status r = MPU9250_Read_Accel_Gyro(&hi2c1, &mpu);
-  if (r == MPU_OK) {
-    p.ax_mg = clamp_i16((int32_t)(mpu.Ax * 1000.0f));
-    p.ay_mg = clamp_i16((int32_t)(mpu.Ay * 1000.0f));
-    p.az_mg = clamp_i16((int32_t)(mpu.Az * 1000.0f));
-
-    p.gx_dps10 = clamp_i16((int32_t)(mpu.Gx * 10.0f));
-    p.gy_dps10 = clamp_i16((int32_t)(mpu.Gy * 10.0f));
-    p.gz_dps10 = clamp_i16((int32_t)(mpu.Gz * 10.0f));
-
-    st_bits |= ST_MPU_OK;
-    if (mpu.accel_sanity_ok) st_bits |= ST_ACCEL_OK;
-  }
-
-  if (armed) st_bits |= ST_ARMED;
-  if (last_cmd_seen) st_bits |= ST_LASTCMD_OK;
-
-  p.status = st_bits;
-
-  /* If imu_enable=0, we still transmit a small packet sometimes?
-     For now: if disabled, still send at 10Hz just to keep link alive.
-  */
-  static uint32_t keepalive_next = 0;
-  uint8_t do_send = 1;
-  if (!imu_enable) {
-    if ((int32_t)(now_ms - keepalive_next) >= 0) {
-      keepalive_next = now_ms + 100;
-      do_send = 1;
-    } else {
-      do_send = 0;
+  // ARM/DISARM (bloqueamos ARM si está calibrando)
+  if (!cal_busy) {
+    if (c->flags & CMD_DISARM) {
+      disarm_now(0);
+    }
+    if (c->flags & CMD_ARM) {
+      armed = 1;
+      motors_write_all(thr_us);
     }
   }
 
-  CmdPkt cmd;
-  uint8_t acklen = 0;
-
-  if (do_send) {
-    (void)NRF24_WriteAndReadAck(&hspi1, &nrf,
-                               &p, (uint8_t)sizeof(p),
-                               &cmd, (uint8_t)sizeof(cmd),
-                               &acklen,
-                               15);
-  } else {
-    // even if we don't send IMU, we can't receive ACK; that's OK.
-    return;
+  // Throttle global
+  if (!cal_busy && (c->flags & CMD_SET_THR)) {
+    thr_us = clamp_u16(c->thr_us, 1000, 2000);
+    motors_write_all(thr_us);
   }
 
-  if (acklen >= sizeof(CmdPkt)) {
-    handle_cmd(&cmd, acklen);
+  // Motor individual (mask)
+  if (!cal_busy && (c->flags & CMD_SET_MOTOR)) {
+    motors_write_mask(c->motor_mask, c->motor_us);
+  }
+}
+
+static void build_send_telem(uint32_t now_ms)
+{
+  TelemPkt p;
+  memset(&p, 0, sizeof(p));
+  p.type = PKT_TELEM;
+  p.tx_seq = tx_seq++;
+  p.t_ms = now_ms;
+
+  uint16_t st = 0;
+
+  if (imu_enable && !cal_busy) {
+    MPU_Status r = MPU9250_Read_Accel_Gyro(&hi2c1, &mpu);
+    if (r == MPU_OK) {
+      p.ax_mg = clamp_i16((int32_t)(mpu.Ax * 1000.0f));
+      p.ay_mg = clamp_i16((int32_t)(mpu.Ay * 1000.0f));
+      p.az_mg = clamp_i16((int32_t)(mpu.Az * 1000.0f));
+
+      p.gx_dps10 = clamp_i16((int32_t)(mpu.Gx * 10.0f));
+      p.gy_dps10 = clamp_i16((int32_t)(mpu.Gy * 10.0f));
+      p.gz_dps10 = clamp_i16((int32_t)(mpu.Gz * 10.0f));
+
+      st |= ST_MPU_OK;
+      if (mpu.accel_sanity_ok) st |= ST_ACCEL_OK;
+    }
+  }
+
+  if (armed) st |= ST_ARMED;
+  if (cal_busy) st |= ST_CAL_BUSY;
+  if (imu_enable) st |= ST_IMU_EN;
+
+  // failsafe flag (solo indicador)
+  if ((HAL_GetTick() - last_cmd_ms) > FAILSAFE_MS) st |= ST_FAILSAFE;
+
+  p.status = st;
+  p.cmd_echo = cmd_echo;
+  p.ping_echo = ping_echo;
+
+  // TX + read ACK (commands)
+  CmdPkt ack;
+  uint8_t acklen = 0;
+  NRF_Status s = NRF24_WriteAndReadAck(&hspi1, &nrf, &p, (uint8_t)sizeof(p),
+                                      &ack, (uint8_t)sizeof(ack), &acklen, 15);
+  (void)s;
+
+  if (acklen == sizeof(CmdPkt) && ack.type == PKT_CMD) {
+    handle_cmd(&ack);
   }
 }
 /* USER CODE END 0 */
@@ -293,65 +394,66 @@ int main(void)
   HAL_Delay(200);
   uart_print("BOOT\r\n");
 
-  /* PWM start */
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
-  __HAL_TIM_MOE_ENABLE(&htim1);
+  motors_start();
+  disarm_now(0);
+  last_cmd_ms = HAL_GetTick();
 
-  /* Start safe */
-  armed = 0;
-  set_all(1000);
-
-  /* MPU init */
+  // ---- MPU init ----
   MPU_Status st = MPU9250_Init(&hi2c1, &mpu);
-  snprintf(txbuf, sizeof(txbuf), "MPU init st=%u who=0x%02X addr=0x%02X\r\n",
-           (unsigned)st, (unsigned)mpu.whoami, (unsigned)(mpu.i2c_addr >> 1));
-  uart_print(txbuf);
-  if (st != MPU_OK) { uart_print("MPU FAIL\r\n"); while (1) HAL_Delay(1000); }
+  if (st != MPU_OK) {
+    uart_print("MPU FAIL\r\n");
+    while (1) { HAL_Delay(1000); }
+  }
+  uart_print("MPU OK\r\n");
 
-  uart_print("Gyro calib... keep still\r\n");
-  st = MPU9250_Calibrate_Gyro(&hi2c1, &mpu, 800);
-  snprintf(txbuf, sizeof(txbuf), "Gyro calib st=%u\r\n", (unsigned)st);
-  uart_print(txbuf);
-
-  /* Set IMU sample divider to ~200Hz if needed */
-  uint8_t div = 4;
-  (void)HAL_I2C_Mem_Write(&hi2c1, mpu.i2c_addr, 0x19, 1, &div, 1, 100);
-
-  /* NRF init */
+  // ---- NRF init ----
   nrf.ce_port  = GPIOB;
   nrf.ce_pin   = GPIO_PIN_0; // CE = PB0
   nrf.csn_port = GPIOB;
   nrf.csn_pin  = GPIO_PIN_1; // CSN = PB1
 
   NRF_Status ns = NRF24_Init(&hspi1, &nrf);
-  snprintf(txbuf, sizeof(txbuf), "NRF init st=%d\r\n", (int)ns);
-  uart_print(txbuf);
-  if (ns != NRF_OK) { uart_print("NRF FAIL\r\n"); while (1) HAL_Delay(1000); }
-
+  if (ns != NRF_OK) {
+    uart_print("NRF FAIL\r\n");
+    while (1) { HAL_Delay(1000); }
+  }
   (void)NRF24_Configure_PTX(&hspi1, &nrf, RF_ADDR, RF_CH, NRF_DATARATE_250K, NRF_PA_LOW);
   uart_print("NRF PTX OK\r\n");
 
-  next_ms = HAL_GetTick();
-  uart_print("IMU 200Hz -> NRF (ACK CMD enabled)\r\n");
-  uart_print("Start DISARMED. Use Pi: arm / t 1100 ...\r\n");
+  next_imu_ms = HAL_GetTick();
+  next_hb_ms  = HAL_GetTick();
   /* USER CODE END 2 */
 
   while (1)
   {
     /* USER CODE BEGIN 3 */
     uint32_t now = HAL_GetTick();
-    if ((int32_t)(now - next_ms) >= 0) {
-      next_ms += IMU_PERIOD_MS;
-      send_imu_and_poll_cmd(now);
+
+    // non-blocking calibration steps
+    cal_step(now);
+
+    // FAILSAFE: if no cmd refresh -> disarm
+    if ((now - last_cmd_ms) > FAILSAFE_MS) {
+      disarm_now(1);
+    }
+
+    // Scheduler:
+    // - if IMU enabled and not calibrating -> 200 Hz telemetry
+    // - else -> heartbeat 20 Hz (still does TX+ACK to keep command link alive)
+    if (imu_enable && !cal_busy) {
+      if ((int32_t)(now - next_imu_ms) >= 0) {
+        next_imu_ms += IMU_PERIOD_MS;
+        build_send_telem(now);
+      }
+    } else {
+      if ((int32_t)(now - next_hb_ms) >= 0) {
+        next_hb_ms += HB_PERIOD_MS;
+        build_send_telem(now);
+      }
     }
     /* USER CODE END 3 */
   }
 }
-
-/* ===== CubeMX init functions ===== */
 
 void SystemClock_Config(void)
 {
