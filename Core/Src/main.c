@@ -42,7 +42,9 @@ static uint8_t  imu_enable = 1;
 static uint8_t  armed = 0;
 static uint16_t thr_us = 1000;
 static uint32_t last_cmd_ms = 0;
-static const uint32_t FAILSAFE_MS = 500;      // disarm if no cmd refresh
+
+// MODIFICACIÓN 1: Failsafe ampliado a 60 segundos para evitar cortes durante las pruebas
+static const uint32_t FAILSAFE_MS = 60000;      
 
 /* Sequence */
 static uint8_t tx_seq = 0;
@@ -306,25 +308,27 @@ static void handle_cmd(const CmdPkt *c)
     return;
   }
 
-  // ARM/DISARM (bloqueamos ARM si está calibrando)
-  if (!cal_busy) {
-    if (c->flags & CMD_DISARM) {
-      disarm_now(0);
-    }
-    if (c->flags & CMD_ARM) {
-      armed = 1;
-      motors_write_all(thr_us);
-    }
+  // MODIFICACIÓN 2: Quitamos el `if (!cal_busy)` de todos los comandos
+  // para forzar que el dron te obedezca siempre, ignorando si se quedó calibrando.
+
+  // ARM/DISARM
+  if (c->flags & CMD_DISARM) {
+    disarm_now(0);
+  }
+  if (c->flags & CMD_ARM) {
+    armed = 1;
+    cal_busy = 0; // Apagamos a la fuerza la calibración si estaba encendida
+    motors_write_all(thr_us);
   }
 
   // Throttle global
-  if (!cal_busy && (c->flags & CMD_SET_THR)) {
+  if (c->flags & CMD_SET_THR) {
     thr_us = clamp_u16(c->thr_us, 1000, 2000);
     motors_write_all(thr_us);
   }
 
   // Motor individual (mask)
-  if (!cal_busy && (c->flags & CMD_SET_MOTOR)) {
+  if (c->flags & CMD_SET_MOTOR) {
     motors_write_mask(c->motor_mask, c->motor_us);
   }
 }
@@ -396,6 +400,14 @@ int main(void)
 
   motors_start();
   disarm_now(0);
+  
+  // MODIFICACIÓN 3: PRUEBA FORZADA HARDWARE
+  // Descomenta estas líneas si la Raspberry Pi dice que armó pero no giran. 
+  // Esto obligará al motor 1 a girar apenas le conectes la batería.
+  // HAL_Delay(3000); // Esperar a que el ESC reconozca los 1000us iniciales de disarm_now()
+  // __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 1150); // Girar Motor 1 a baja velocidad
+  // -----------------------------------------------------------
+
   last_cmd_ms = HAL_GetTick();
 
   // ---- MPU init ----
