@@ -44,7 +44,7 @@ static uint16_t thr_us = 1000;
 static uint32_t last_cmd_ms = 0;
 
 // MODIFICACIÓN 1: Failsafe ampliado a 60 segundos para evitar cortes durante las pruebas
-static const uint32_t FAILSAFE_MS = 60000;      
+static const uint32_t FAILSAFE_MS = 15000 ;      
 
 /* Sequence */
 static uint8_t tx_seq = 0;
