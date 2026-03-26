@@ -39,3 +39,4 @@ drone_v1\main.o: ../Core/Inc/nrf24.h
 drone_v1\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdbool.h
 drone_v1\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\string.h
 drone_v1\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdio.h
+drone_v1\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\math.h
