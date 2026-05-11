@@ -2,73 +2,58 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Horus Link - MPU9250 + Motors + NRF24 (ACK commands) robust
+  * @brief          : Control LQI (LQR + Integral) + Timer Flag + LPF Seguro
   ******************************************************************************
   */
 /* USER CODE END Header */
 
 #include "main.h"
-
-/* USER CODE BEGIN Includes */
 #include "mpu9250.h"
 #include "nrf24.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
-/* USER CODE END Includes */
+#include <math.h>
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
 SPI_HandleTypeDef hspi1;
 TIM_HandleTypeDef htim1;
 UART_HandleTypeDef huart2;
+TIM_HandleTypeDef htim2;
 
-/* USER CODE BEGIN PV */
 static MPU9250_t mpu;
 static NRF24_t nrf;
 
-/* RF MUST match Pi */
 static const uint8_t RF_ADDR[5] = {'D','R','O','N','E'};
 static const uint8_t RF_CH = 110;
 
-/* Rates */
-static const uint32_t IMU_HZ = 200;
-static const uint32_t IMU_PERIOD_MS = 5;      // 200 Hz
-static const uint32_t HB_PERIOD_MS  = 50;     // 20 Hz heartbeat when IMU off/busy
+static const uint32_t HB_PERIOD_MS  = 50;  
 
-/* Link / state */
 static uint8_t  imu_enable = 1;
 static uint8_t  armed = 0;
 static uint16_t thr_us = 1000;
 static uint32_t last_cmd_ms = 0;
+static const uint32_t FAILSAFE_MS = 15000;  
 
-// MODIFICACIÓN 1: Failsafe ampliado a 60 segundos para evitar cortes durante las pruebas
-static const uint32_t FAILSAFE_MS = 15000 ;      
-
-/* Sequence */
 static uint8_t tx_seq = 0;
 static uint8_t cmd_echo = 0;
 static uint8_t ping_echo = 0;
 
-/* Calibration state machine (non-blocking) */
-static uint8_t cal_busy = 0;
+static uint8_t  cal_busy = 0;
 static uint16_t cal_samples_target = 800;
 static uint16_t cal_count = 0;
 static int32_t gxs=0,gys=0,gzs=0;
 static int32_t axs=0,ays=0,azs=0;
 static uint32_t cal_next_ms = 0;
-static const uint32_t CAL_SAMPLE_PERIOD_MS = 5;  // same as your old delay
+static const uint32_t CAL_SAMPLE_PERIOD_MS = 5;
 
-/* Schedulers */
-static uint32_t next_imu_ms = 0;
 static uint32_t next_hb_ms  = 0;
 
-/* Packet types */
 #define PKT_TELEM   0xA1
 #define PKT_CMD     0xB1
 
-/* Status bits */
 #define ST_MPU_OK     (1U<<0)
 #define ST_ACCEL_OK   (1U<<1)
 #define ST_ARMED      (1U<<2)
@@ -76,7 +61,6 @@ static uint32_t next_hb_ms  = 0;
 #define ST_IMU_EN     (1U<<4)
 #define ST_FAILSAFE   (1U<<5)
 
-/* Command flags */
 #define CMD_ARM        (1U<<0)
 #define CMD_DISARM     (1U<<1)
 #define CMD_ESTOP      (1U<<2)
@@ -85,91 +69,105 @@ static uint32_t next_hb_ms  = 0;
 #define CMD_IMU_EN     (1U<<5)
 #define CMD_CAL_ALL    (1U<<6)
 #define CMD_PING       (1U<<7)
+#define CMD_SET_PID    (1U<<8)
 
-/* Motor mask bits */
 #define M1_BIT (1U<<0)
 #define M2_BIT (1U<<1)
 #define M3_BIT (1U<<2)
 #define M4_BIT (1U<<3)
 
+/* ===== VARIABLES DEL CONTROL LQI ===== */
+static float roll_angle = 0.0f;     
+static float roll_sp = 0.0f;        
+
+static float q_ang = 25.0f;      
+static float q_rate = 2.0f;      
+static float r_ctrl = 1.0f;      
+static float b_param = 1.0f;     
+
+static float K1 = 0.0f;          
+static float K2 = 0.0f;          
+static int32_t trim_m1_m4 = 0; 
+
+// --- NUEVAS VARIABLES PARA EL TÃ‰RMINO INTEGRAL ---
+static float Ki_ang = 0.5f;      // Ganancia Integral
+static float Iterm_ang = 0.0f;   // Acumulador de error
+static const float I_LIM = 50.0f; // Anti-windup lÃ­mite 
+
+static const float Ts = 0.005f;     
+static const float U_LIM = 250.0f;   
+
+static uint32_t manual_override_until_ms = 0;
+static uint8_t  manual_mask = 0;
+static uint16_t manual_us   = 1000;
+
+static volatile uint8_t imu_last_ok = 0;
+static volatile uint8_t flag_200hz = 0; 
+
+/* ===== VARIABLES DEL FILTRO PASO BAJO ===== */
+static float ax_f = 0.0f, ay_f = 0.0f, az_f = 0.0f;
+static float gx_f = 0.0f, gy_f = 0.0f, gz_f = 0.0f;
+
+static float alpha_acc  = 0.05f;  
+static float alpha_gyro = 0.15f;  
+
 #pragma pack(push,1)
-/* Pi -> STM (ACK payload) : 12 bytes */
 typedef struct {
-  uint8_t  type;        // 0xB1
-  uint8_t  cmd_seq;     // increments each command
-  uint16_t flags;       // CMD_*
-  uint16_t thr_us;      // 1000..2000
-  uint8_t  motor_mask;  // M1..M4 bits
-  uint16_t motor_us;    // 1000..2000
-  uint8_t  imu_enable;  // 0/1
-  uint8_t  ping_id;     // increments when user 'ping'
+  uint8_t  type;        
+  uint8_t  cmd_seq;     
+  uint16_t flags;       
+  uint16_t thr_us;      
+  uint8_t  motor_mask;  
+  uint16_t motor_us;    
+  uint8_t  imu_enable;  
+  uint8_t  ping_id;     
+  uint8_t  pad;         
 } CmdPkt;
 
-/* STM -> Pi : 24 bytes (<=32) */
 typedef struct {
-  uint8_t  type;        // 0xA1
-  uint8_t  tx_seq;      // increments always
+  uint8_t  type;        
+  uint8_t  tx_seq;      
   uint32_t t_ms;
   int16_t  ax_mg, ay_mg, az_mg;
   int16_t  gx_dps10, gy_dps10, gz_dps10;
   uint16_t status;
-  uint8_t  cmd_echo;    // last cmd_seq applied/accepted
-  uint8_t  ping_echo;   // last ping_id seen
+  uint8_t  cmd_echo;
+  uint8_t  ping_echo;
 } TelemPkt;
 #pragma pack(pop)
 
-/* USER CODE END PV */
-
-/* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_TIM1_Init(void);
+static void MX_TIM2_Init(void);
 static void MX_USART2_UART_Init(void);
+void Error_Handler(void);
 
-/* USER CODE BEGIN PFP */
-static void uart_print(const char *s);
-
-static inline uint16_t clamp_u16(uint16_t v, uint16_t lo, uint16_t hi);
-static inline int16_t clamp_i16(int32_t v);
-
-static void motors_start(void);
-static void motors_write_all(uint16_t us);
-static void motors_write_mask(uint8_t mask, uint16_t us);
-static void disarm_now(uint8_t set_failsafe_flag);
-
-static bool mpu_read_raw_gyro(int16_t *gx, int16_t *gy, int16_t *gz);
-static bool mpu_read_raw_accel(int16_t *ax, int16_t *ay, int16_t *az);
-static void cal_start(uint16_t samples);
-static void cal_step(uint32_t now_ms);
-
-static void build_send_telem(uint32_t now_ms);
-static void handle_cmd(const CmdPkt *c);
-/* USER CODE END PFP */
-
-/* USER CODE BEGIN 0 */
-static void uart_print(const char *s)
-{
+static void uart_print(const char *s) {
   HAL_UART_Transmit(&huart2, (uint8_t*)s, (uint16_t)strlen(s), 200);
 }
 
-static inline uint16_t clamp_u16(uint16_t v, uint16_t lo, uint16_t hi)
-{
+static inline uint16_t clamp_u16(uint16_t v, uint16_t lo, uint16_t hi) {
   if (v < lo) return lo;
   if (v > hi) return hi;
   return v;
 }
 
-static inline int16_t clamp_i16(int32_t v)
-{
+static inline int16_t clamp_i16(int32_t v) {
   if (v > 32767) return 32767;
   if (v < -32768) return -32768;
   return (int16_t)v;
 }
 
-static void motors_start(void)
-{
+static inline float clampf(float v, float lo, float hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static void motors_start(void) {
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
@@ -177,39 +175,53 @@ static void motors_start(void)
   __HAL_TIM_MOE_ENABLE(&htim1);
 }
 
-static void motors_write_all(uint16_t us)
-{
+static void motors_write_all(uint16_t us) {
   us = clamp_u16(us, 1000, 2000);
   if (!armed) us = 1000;
-
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, us);
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, us);
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, us);
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, us);
 }
 
-static void motors_write_mask(uint8_t mask, uint16_t us)
-{
+static void motors_write_mask(uint8_t mask, uint16_t us) {
   us = clamp_u16(us, 1000, 2000);
   if (!armed) us = 1000;
-
   if (mask & M1_BIT) __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, us);
   if (mask & M2_BIT) __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, us);
   if (mask & M3_BIT) __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, us);
   if (mask & M4_BIT) __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, us);
 }
 
-static void disarm_now(uint8_t set_failsafe_flag)
-{
+static void motors_write_roll_mix(uint16_t thr, float u_roll_us) {
+  if (!armed) {
+    motors_write_all(1000);
+    return;
+  }
+  uint16_t t = clamp_u16(thr, 1000, 2000);
+  float u = clampf(u_roll_us, -U_LIM, +U_LIM);
+
+  int32_t m1 = (int32_t)t - (int32_t)u + trim_m1_m4;
+  int32_t m4 = (int32_t)t - (int32_t)u + trim_m1_m4;
+  int32_t m2 = (int32_t)t + (int32_t)u;
+  int32_t m3 = (int32_t)t + (int32_t)u;
+
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, clamp_u16((uint16_t)m1, 1000, 2000));
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, clamp_u16((uint16_t)m2, 1000, 2000));
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, clamp_u16((uint16_t)m3, 1000, 2000));
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, clamp_u16((uint16_t)m4, 1000, 2000));
+}
+
+static void disarm_now(uint8_t set_failsafe_flag) {
   (void)set_failsafe_flag;
   armed = 0;
   thr_us = 1000;
   motors_write_all(1000);
+  roll_angle = 0.0f; 
+  Iterm_ang = 0.0f; // Resetear el acumulador integral por seguridad
 }
 
-/* --- raw reads for non-blocking calibration --- */
-static bool mpu_read_raw_gyro(int16_t *gx, int16_t *gy, int16_t *gz)
-{
+static bool mpu_read_raw_gyro(int16_t *gx, int16_t *gy, int16_t *gz) {
   uint8_t d[6];
   if (HAL_I2C_Mem_Read(&hi2c1, mpu.i2c_addr, 0x43, 1, d, 6, 100) != HAL_OK) return false;
   *gx = (int16_t)((d[0]<<8) | d[1]);
@@ -218,8 +230,7 @@ static bool mpu_read_raw_gyro(int16_t *gx, int16_t *gy, int16_t *gz)
   return true;
 }
 
-static bool mpu_read_raw_accel(int16_t *ax, int16_t *ay, int16_t *az)
-{
+static bool mpu_read_raw_accel(int16_t *ax, int16_t *ay, int16_t *az) {
   uint8_t d[6];
   if (HAL_I2C_Mem_Read(&hi2c1, mpu.i2c_addr, 0x3B, 1, d, 6, 100) != HAL_OK) return false;
   *ax = (int16_t)((d[0]<<8) | d[1]);
@@ -228,20 +239,17 @@ static bool mpu_read_raw_accel(int16_t *ax, int16_t *ay, int16_t *az)
   return true;
 }
 
-static void cal_start(uint16_t samples)
-{
+static void cal_start(uint16_t samples) {
   cal_busy = 1;
   cal_samples_target = samples;
   cal_count = 0;
   gxs=gys=gzs=0;
   axs=ays=azs=0;
   cal_next_ms = HAL_GetTick();
-  // Por seguridad: desarmar y dejar 1000us
   disarm_now(0);
 }
 
-static void cal_step(uint32_t now_ms)
-{
+static void cal_step(uint32_t now_ms) {
   if (!cal_busy) return;
   if ((int32_t)(now_ms - cal_next_ms) < 0) return;
   cal_next_ms += CAL_SAMPLE_PERIOD_MS;
@@ -255,86 +263,132 @@ static void cal_step(uint32_t now_ms)
   cal_count++;
 
   if (cal_count >= cal_samples_target) {
-    // Gyro offsets (deg/s) using 131 LSB/dps
-    float gxo = ((float)gxs / (float)cal_count) / 131.0f;
-    float gyo = ((float)gys / (float)cal_count) / 131.0f;
-    float gzo = ((float)gzs / (float)cal_count) / 131.0f;
+    mpu.Gx_offset = ((float)gxs / (float)cal_count) / 131.0f;
+    mpu.Gy_offset = ((float)gys / (float)cal_count) / 131.0f;
+    mpu.Gz_offset = ((float)gzs / (float)cal_count) / 131.0f;
 
-    // Accel offsets (g) using 16384 LSB/g
-    float axo = ((float)axs / (float)cal_count) / 16384.0f;
-    float ayo = ((float)ays / (float)cal_count) / 16384.0f;
-    float azo = ((float)azs / (float)cal_count) / 16384.0f;
-
-    mpu.Gx_offset = gxo;
-    mpu.Gy_offset = gyo;
-    mpu.Gz_offset = gzo;
-
-    mpu.Ax_offset = axo;
-    mpu.Ay_offset = ayo;
-    // Z debe ser +1g en reposo
-    mpu.Az_offset = azo - 1.0f;
+    mpu.Ax_offset = ((float)axs / (float)cal_count) / 16384.0f;
+    mpu.Ay_offset = ((float)ays / (float)cal_count) / 16384.0f;
+    mpu.Az_offset = (((float)azs / (float)cal_count) / 16384.0f) - 1.0f;
 
     cal_busy = 0;
   }
 }
 
-static void handle_cmd(const CmdPkt *c)
+static void lqr_recalculate_gains(void) {
+  float r_val = r_ctrl;
+  float b_val = b_param;
+
+  if (r_val < 0.001f) r_val = 0.001f;
+  if (b_val < 0.001f) b_val = 0.001f;
+
+  K1 = sqrtf(q_ang / r_val);
+  float inside = (2.0f / b_val) * K1 + (q_rate / r_val);
+  if (inside < 0.0f) inside = 0.0f;
+  K2 = sqrtf(inside);
+}
+
+/* ====================================================================
+ * CÃLCULO DE CONTROL Y FILTROS
+ * ==================================================================== */
+static void lqr_roll_update_and_apply(void) {
+
+  if (!imu_enable || cal_busy) return;
+
+  ax_f = ax_f + alpha_acc  * (mpu.Ax - ax_f);
+  ay_f = ay_f + alpha_acc  * (mpu.Ay - ay_f);
+  az_f = az_f + alpha_acc  * (mpu.Az - az_f);
+
+  gx_f = gx_f + alpha_gyro * (mpu.Gx - gx_f);
+  gy_f = gy_f + alpha_gyro * (mpu.Gy - gy_f);
+  gz_f = gz_f + alpha_gyro * (mpu.Gz - gz_f);
+
+  float acc_roll = atan2f(ay_f, az_f) * (180.0f / 3.14159265f);
+  roll_angle = 0.98f * (roll_angle + (gx_f * Ts)) + 0.02f * acc_roll;
+
+  if (!armed) return;
+
+  if ((int32_t)(HAL_GetTick() - manual_override_until_ms) < 0) {
+    motors_write_mask(manual_mask, manual_us);
+    return;
+  }
+
+
+  float err_angle = roll_sp - roll_angle;
+  
+  Iterm_ang += err_angle * Ts;
+  Iterm_ang = clampf(Iterm_ang, -I_LIM, I_LIM); 
+
+  float u = (K1 * err_angle) + (Ki_ang * Iterm_ang) - (K2 * gx_f); 
+  
+  u = clampf(u, -U_LIM, +U_LIM);
+
+  motors_write_roll_mix(thr_us, u);
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-  // Validación básica
+  if (htim->Instance == TIM2) {
+    flag_200hz = 1; 
+  }
+}
+
+static void handle_cmd(const CmdPkt *c) {
   if (!c || c->type != PKT_CMD) return;
 
   last_cmd_ms = HAL_GetTick();
   cmd_echo = c->cmd_seq;
 
-  // Ping
-  if (c->flags & CMD_PING) {
-    ping_echo = c->ping_id;
-  }
-
-  // IMU enable
-  if (c->flags & CMD_IMU_EN) {
-    imu_enable = (c->imu_enable ? 1 : 0);
-  }
-
-  // ESTOP
-  if (c->flags & CMD_ESTOP) {
-    disarm_now(0);
-    return;
-  }
-
-  // CAL (gyro+acc juntos)
-  if (c->flags & CMD_CAL_ALL) {
-    cal_start(800); // fijo por ahora
-    return;
-  }
-
-  // MODIFICACIÓN 2: Quitamos el `if (!cal_busy)` de todos los comandos
-  // para forzar que el dron te obedezca siempre, ignorando si se quedó calibrando.
-
-  // ARM/DISARM
-  if (c->flags & CMD_DISARM) {
-    disarm_now(0);
-  }
+  if (c->flags & CMD_PING) ping_echo = c->ping_id;
+  if (c->flags & CMD_IMU_EN) imu_enable = (c->imu_enable ? 1 : 0);
+  if (c->flags & CMD_ESTOP) { disarm_now(0); return; }
+  if (c->flags & CMD_CAL_ALL) { cal_start(800); return; }
+  if (c->flags & CMD_DISARM) disarm_now(0);
+  
   if (c->flags & CMD_ARM) {
     armed = 1;
-    cal_busy = 0; // Apagamos a la fuerza la calibración si estaba encendida
     motors_write_all(thr_us);
+    roll_angle = 0.0f; 
+    Iterm_ang = 0.0f;
+    
+    ax_f = mpu.Ax; ay_f = mpu.Ay; az_f = mpu.Az;
+    gx_f = mpu.Gx; gy_f = mpu.Gy; gz_f = mpu.Gz;
   }
-
-  // Throttle global
+  
   if (c->flags & CMD_SET_THR) {
     thr_us = clamp_u16(c->thr_us, 1000, 2000);
     motors_write_all(thr_us);
   }
-
-  // Motor individual (mask)
   if (c->flags & CMD_SET_MOTOR) {
-    motors_write_mask(c->motor_mask, c->motor_us);
+    manual_mask = c->motor_mask;
+    manual_us   = clamp_u16(c->motor_us, 1000, 2000);
+    manual_override_until_ms = HAL_GetTick() + 300; 
+    motors_write_mask(manual_mask, manual_us);
+  }
+
+  if (c->flags & CMD_SET_PID) {
+    float v = ((float)((int16_t)c->motor_us)) / 256.0f;
+    uint8_t sel = c->motor_mask;
+
+    if (sel == 0) q_ang = v;
+    else if (sel == 1) q_rate = v;
+    else if (sel == 2) r_ctrl = v;
+    else if (sel == 3) roll_sp = v;      
+    else if (sel == 4) b_param = v;     
+    else if (sel == 5) trim_m1_m4 = (int32_t)v; 
+    else if (sel == 6) { Ki_ang = v; Iterm_ang = 0.0f; }
+
+    if (sel == 0 || sel == 1 || sel == 2 || sel == 4) {
+      lqr_recalculate_gains();
+    }
+
+    char msg[100];
+    snprintf(msg, sizeof(msg), "LQR set: sel=%u v=%.3f | Gains: K1=%.3f K2=%.3f Ki=%.3f\r\n", sel, v, K1, K2, Ki_ang);
+    uart_print(msg);
   }
 }
 
-static void build_send_telem(uint32_t now_ms)
-{
+static void build_send_telem(uint32_t now_ms) {
   TelemPkt p;
   memset(&p, 0, sizeof(p));
   p.type = PKT_TELEM;
@@ -343,127 +397,115 @@ static void build_send_telem(uint32_t now_ms)
 
   uint16_t st = 0;
 
-  if (imu_enable && !cal_busy) {
-    MPU_Status r = MPU9250_Read_Accel_Gyro(&hi2c1, &mpu);
-    if (r == MPU_OK) {
-      p.ax_mg = clamp_i16((int32_t)(mpu.Ax * 1000.0f));
-      p.ay_mg = clamp_i16((int32_t)(mpu.Ay * 1000.0f));
-      p.az_mg = clamp_i16((int32_t)(mpu.Az * 1000.0f));
+  if (imu_enable && !cal_busy && imu_last_ok) {
+    p.ax_mg = clamp_i16((int32_t)(ax_f * 1000.0f));
+    p.ay_mg = clamp_i16((int32_t)(ay_f * 1000.0f));
+    p.az_mg = clamp_i16((int32_t)(az_f * 1000.0f));
 
-      p.gx_dps10 = clamp_i16((int32_t)(mpu.Gx * 10.0f));
-      p.gy_dps10 = clamp_i16((int32_t)(mpu.Gy * 10.0f));
-      p.gz_dps10 = clamp_i16((int32_t)(mpu.Gz * 10.0f));
+    p.gx_dps10 = clamp_i16((int32_t)(gx_f * 10.0f));
+    p.gy_dps10 = clamp_i16((int32_t)(gy_f * 10.0f));
+    p.gz_dps10 = clamp_i16((int32_t)(gz_f * 10.0f));
 
-      st |= ST_MPU_OK;
-      if (mpu.accel_sanity_ok) st |= ST_ACCEL_OK;
-    }
+    st |= ST_MPU_OK;
+    if (mpu.accel_sanity_ok) st |= ST_ACCEL_OK;
   }
 
   if (armed) st |= ST_ARMED;
   if (cal_busy) st |= ST_CAL_BUSY;
   if (imu_enable) st |= ST_IMU_EN;
-
-  // failsafe flag (solo indicador)
   if ((HAL_GetTick() - last_cmd_ms) > FAILSAFE_MS) st |= ST_FAILSAFE;
 
   p.status = st;
   p.cmd_echo = cmd_echo;
   p.ping_echo = ping_echo;
 
-  // TX + read ACK (commands)
   CmdPkt ack;
   uint8_t acklen = 0;
-  NRF_Status s = NRF24_WriteAndReadAck(&hspi1, &nrf, &p, (uint8_t)sizeof(p),
-                                      &ack, (uint8_t)sizeof(ack), &acklen, 15);
-  (void)s;
+  (void)NRF24_WriteAndReadAck(&hspi1, &nrf,
+                             &p, (uint8_t)sizeof(p),
+                             &ack, (uint8_t)sizeof(ack),
+                             &acklen, 15);
 
   if (acklen == sizeof(CmdPkt) && ack.type == PKT_CMD) {
     handle_cmd(&ack);
   }
 }
-/* USER CODE END 0 */
 
-int main(void)
-{
+int main(void) {
   HAL_Init();
   SystemClock_Config();
-
   MX_GPIO_Init();
   MX_I2C1_Init();
   MX_SPI1_Init();
   MX_TIM1_Init();
+  MX_TIM2_Init();
   MX_USART2_UART_Init();
 
-  /* USER CODE BEGIN 2 */
   HAL_Delay(200);
   uart_print("BOOT\r\n");
 
   motors_start();
   disarm_now(0);
-  
-  // MODIFICACIÓN 3: PRUEBA FORZADA HARDWARE
-  // Descomenta estas líneas si la Raspberry Pi dice que armó pero no giran. 
-  // Esto obligará al motor 1 a girar apenas le conectes la batería.
-  // HAL_Delay(3000); // Esperar a que el ESC reconozca los 1000us iniciales de disarm_now()
-  // __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 1150); // Girar Motor 1 a baja velocidad
-  // -----------------------------------------------------------
-
   last_cmd_ms = HAL_GetTick();
 
-  // ---- MPU init ----
-  MPU_Status st = MPU9250_Init(&hi2c1, &mpu);
-  if (st != MPU_OK) {
+  if (MPU9250_Init(&hi2c1, &mpu) != MPU_OK) {
     uart_print("MPU FAIL\r\n");
     while (1) { HAL_Delay(1000); }
   }
   uart_print("MPU OK\r\n");
 
-  // ---- NRF init ----
   nrf.ce_port  = GPIOB;
-  nrf.ce_pin   = GPIO_PIN_0; // CE = PB0
+  nrf.ce_pin   = GPIO_PIN_0;
   nrf.csn_port = GPIOB;
-  nrf.csn_pin  = GPIO_PIN_1; // CSN = PB1
+  nrf.csn_pin  = GPIO_PIN_1;
 
-  NRF_Status ns = NRF24_Init(&hspi1, &nrf);
-  if (ns != NRF_OK) {
+  if (NRF24_Init(&hspi1, &nrf) != NRF_OK) {
     uart_print("NRF FAIL\r\n");
     while (1) { HAL_Delay(1000); }
   }
   (void)NRF24_Configure_PTX(&hspi1, &nrf, RF_ADDR, RF_CH, NRF_DATARATE_250K, NRF_PA_LOW);
   uart_print("NRF PTX OK\r\n");
 
-  next_imu_ms = HAL_GetTick();
+  lqr_recalculate_gains(); 
+
+  HAL_NVIC_SetPriority(TIM2_IRQn, 0, 0); 
+  HAL_NVIC_EnableIRQ(TIM2_IRQn);
+  
+  // ENCENDER RELOJ DEL TIMER Y ARRANCAR
+  __HAL_RCC_TIM2_CLK_ENABLE();
+  HAL_TIM_Base_Start_IT(&htim2); 
+
   next_hb_ms  = HAL_GetTick();
-  /* USER CODE END 2 */
 
-  while (1)
-  {
-    /* USER CODE BEGIN 3 */
+  /* BUCLE PRINCIPAL */
+  while (1) {
     uint32_t now = HAL_GetTick();
+    
+    // 1. CONTROL A 200HZ EXACTOS
+    if (flag_200hz) {
+      flag_200hz = 0; // Bajamos la bandera
+      
+      if (imu_enable && !cal_busy) {
+        imu_last_ok = (MPU9250_Read_Accel_Gyro(&hi2c1, &mpu) == MPU_OK) ? 1 : 0;
+        if (imu_last_ok) {
+          lqr_roll_update_and_apply();
+        }
+      }
+    }
 
-    // non-blocking calibration steps
+    // 2. CalibraciÃ³n
     cal_step(now);
 
-    // FAILSAFE: if no cmd refresh -> disarm
+    // 3. Failsafe
     if ((now - last_cmd_ms) > FAILSAFE_MS) {
       disarm_now(1);
     }
 
-    // Scheduler:
-    // - if IMU enabled and not calibrating -> 200 Hz telemetry
-    // - else -> heartbeat 20 Hz (still does TX+ACK to keep command link alive)
-    if (imu_enable && !cal_busy) {
-      if ((int32_t)(now - next_imu_ms) >= 0) {
-        next_imu_ms += IMU_PERIOD_MS;
-        build_send_telem(now);
-      }
-    } else {
-      if ((int32_t)(now - next_hb_ms) >= 0) {
-        next_hb_ms += HB_PERIOD_MS;
-        build_send_telem(now);
-      }
+    // 4. TelemetrÃ­a
+    if ((int32_t)(now - next_hb_ms) >= 0) {
+      next_hb_ms += HB_PERIOD_MS;
+      build_send_telem(now);
     }
-    /* USER CODE END 3 */
   }
 }
 
@@ -519,18 +561,13 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-
-  // *** IMPORTANT: slow down SPI for nRF modules ***
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64; //
-
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
   hspi1.Init.CRCPolynomial = 10;
   if (HAL_SPI_Init(&hspi1) != HAL_OK) { Error_Handler(); }
 }
-
-
 
 static void MX_TIM1_Init(void)
 {
@@ -576,6 +613,30 @@ static void MX_TIM1_Init(void)
   HAL_TIM_MspPostInit(&htim1);
 }
 
+static void MX_TIM2_Init(void)
+{
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+	
+	__HAL_RCC_TIM2_CLK_ENABLE();
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 83; 
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 4999; 
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK) { Error_Handler(); }
+
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK) { Error_Handler(); }
+
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK) { Error_Handler(); }
+}
+
 static void MX_USART2_UART_Init(void)
 {
   huart2.Instance = USART2;
@@ -611,11 +672,3 @@ void Error_Handler(void)
   __disable_irq();
   while (1) {}
 }
-
-#ifdef  USE_FULL_ASSERT
-void assert_failed(uint8_t *file, uint32_t line)
-{
-  (void)file;
-  (void)line;
-}
-#endif /* USE_FULL_ASSERT */
