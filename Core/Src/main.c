@@ -2,11 +2,11 @@
 /**
  ******************************************************************************
  * @file           : main.c
- * @brief          : STM32 LQI/LQG/FUZZY Multiplexer - V9.4.1 (Con LED de Armado)
+ * @brief          : STM32 LQI/LQG/FUZZY/PID Multiplexer - V9.5
  *
- * - ERROR DE SIGNO CORREGIDO: Fuzzy usa retroalimentación negativa (-).
- * - DESBORDAMIENTO CORREGIDO: Límites Fuzzy desempaquetados a /10.0f.
- * - INDICADOR VISUAL: LED en PC13 parpadea 3 veces al armar (No bloqueante).
+ * - AÑADIDO: Modo de control PID Clásico (Mode = 3).
+ * - MULTIPLEXACIÓN: Reutiliza el payload de 27 bytes para no perder velocidad.
+ * - SEGURIDAD: Comparte el Anti-Windup (AW) y el límite maestro U_LIMIT.
  ******************************************************************************
  */
 /* USER CODE END Header */
@@ -55,7 +55,6 @@ static uint32_t cal_next_ms        = 0;
 static const uint32_t CAL_SAMPLE_PERIOD_MS = 5;
 static uint32_t next_hb_ms         = 0;
 
-// Variables para el parpadeo del LED
 static uint8_t  arm_blink_count = 0;
 static uint32_t next_blink_ms   = 0;
 
@@ -82,6 +81,7 @@ static uint32_t next_blink_ms   = 0;
 #define CMD_UPDATE_K      (1U<<8)   
 #define CMD_SET_AW        (1U<<9)   
 #define CMD_UPDATE_FUZZY  (1U<<10) 
+#define CMD_UPDATE_PID    (1U<<11) // <--- NUEVA BANDERA PID
 
 static volatile uint8_t imu_last_ok = 0;
 static volatile uint8_t flag_200hz  = 0;
@@ -114,6 +114,7 @@ static float int_e_roll  = 0.0f;
 static float int_e_pitch = 0.0f;
 static float int_limit = 65.0f; 
 
+// Ganancias LQI
 static float K_roll_ang   = 9.058f;
 static float K_roll_rate  = 0.683f;
 static float K_roll_int   = 1.287f;     
@@ -121,9 +122,14 @@ static float K_pitch_ang  = 14.639f;
 static float K_pitch_rate = 12.095f;
 static float K_pitch_int  = 1.752f;     
 
+// Parámetros Fuzzy
 static float fz_e_max   = 30.0f;  
 static float fz_r_max   = 200.0f; 
 static float fz_out_max = 300.0f; 
+
+// Ganancias PID Clásico
+static float pid_kp_roll = 1.2f, pid_ki_roll = 0.1f, pid_kd_roll = 0.05f;
+static float pid_kp_pitch = 1.2f, pid_ki_pitch = 0.1f, pid_kd_pitch = 0.05f;
 
 static const float U_LIMIT = 300.0f;   
 
@@ -342,13 +348,15 @@ static void control_update(void) {
     float final_roll_est = 0.0f, final_pitch_est = 0.0f;
     float final_gx = gx_f, final_gy = gy_f;
 
-    if (current_ctrl_mode == 0 || current_ctrl_mode == 2) {
+    // Estimador de Actitud (Modos 0, 2 y 3)
+    if (current_ctrl_mode == 0 || current_ctrl_mode == 2 || current_ctrl_mode == 3) {
         roll_deg  = 0.98f * (roll_deg  + gx_f * dt_control) + 0.02f * roll_acc;
         pitch_deg = 0.98f * (pitch_deg + gy_f * dt_control) + 0.02f * pitch_acc;
         final_roll_est = roll_deg; final_pitch_est = pitch_deg;
         x_hat_roll[0] = roll_deg; x_hat_roll[1] = gx_f;
         x_hat_pitch[0] = pitch_deg; x_hat_pitch[1] = gy_f;
     }
+    // Estimador LQG Kalman (Modo 1)
     else if (current_ctrl_mode == 1) {
         float x_pred_roll[2];
         x_pred_roll[0] = A_r[0][0]*x_hat_roll[0] + A_r[0][1]*x_hat_roll[1] + B_r[0]*last_u_roll;
@@ -382,16 +390,29 @@ static void control_update(void) {
     float e_roll = final_roll_est - target_roll;
     float e_pitch = final_pitch_est - target_pitch;
 
-    if (current_ctrl_mode == 0 || current_ctrl_mode == 1) {
+    // Acumulador de Integral (LQI, LQG, PID)
+    if (current_ctrl_mode == 0 || current_ctrl_mode == 1 || current_ctrl_mode == 3) {
         int_e_roll  += e_roll  * dt_control; int_e_pitch += e_pitch * dt_control;
         int_e_roll  = clamp_f(int_e_roll,  -int_limit, int_limit); int_e_pitch = clamp_f(int_e_pitch, -int_limit, int_limit);
+    }
 
+    // --- MÁQUINA DE ESTADOS DE CONTROLADORES ---
+    if (current_ctrl_mode == 0 || current_ctrl_mode == 1) {
+        // LQI Clásico / LQG
         u_roll  = -(K_roll_ang * e_roll  + K_roll_rate * final_gx + K_roll_int * int_e_roll);
         u_pitch = -(K_pitch_ang * e_pitch + K_pitch_rate * final_gy + K_pitch_int * int_e_pitch);
     }
     else if (current_ctrl_mode == 2) {
+        // Lógica Difusa (Fuzzy)
         u_roll  = -compute_fuzzy(e_roll, final_gx);
         u_pitch = -compute_fuzzy(e_pitch, final_gy);
+    }
+    else if (current_ctrl_mode == 3) {
+        // PID Clásico: u = Kp*e + Ki*int(e) + Kd*(-gyro)
+        // Usamos (-gx) para la derivada y evitar el Derivative Kick (no derivamos el setpoint).
+        // Se mantiene el factor de multiplicación negativo '-' para igualar la polaridad de motores con el LQI.
+        u_roll  = -(pid_kp_roll * e_roll + pid_ki_roll * int_e_roll + pid_kd_roll * final_gx);
+        u_pitch = -(pid_kp_pitch * e_pitch + pid_ki_pitch * int_e_pitch + pid_kd_pitch * final_gy);
     }
     
     last_u_roll = u_roll; last_u_pitch = u_pitch;
@@ -430,6 +451,16 @@ static void handle_cmd(const CmdPkt *c) {
         fz_out_max = (float)c->k_roll_int_x1000   / 10.0f;
         uart_print("FUZZY LIMITS UPDATED\r\n");
     }
+    // MULTIPLEXACIÓN: Cargamos variables de PID desde los mismos bytes
+    else if (c->flags & CMD_UPDATE_PID) {
+        pid_kp_roll = (float)c->k_roll_ang_x1000 / 1000.0f;
+        pid_kd_roll = (float)c->k_roll_rate_x1000 / 1000.0f; // Asignado a Rate
+        pid_ki_roll = (float)c->k_roll_int_x1000 / 1000.0f;  // Asignado a Int
+        pid_kp_pitch = (float)c->k_pitch_ang_x1000 / 1000.0f;
+        pid_kd_pitch = (float)c->k_pitch_rate_x1000 / 1000.0f;
+        pid_ki_pitch = (float)c->k_pitch_int_x1000 / 1000.0f;
+        uart_print("PID UPDATED\r\n");
+    }
     else if (c->flags & CMD_UPDATE_K) {
         K_roll_ang   = (float)c->k_roll_ang_x1000   / 1000.0f;
         K_roll_rate  = (float)c->k_roll_rate_x1000  / 1000.0f;
@@ -454,7 +485,6 @@ static void handle_cmd(const CmdPkt *c) {
             armed = 1; motors_running = 0; int_e_roll = 0.0f; int_e_pitch = 0.0f;
             motors_write_all(1000); uart_print("ARMED\r\n");
             
-            // Iniciar ráfaga de parpadeo del LED
             arm_blink_count = 6; 
             next_blink_ms = HAL_GetTick();
         }
@@ -477,7 +507,7 @@ static void build_send_telem(uint32_t now_ms) {
     if (armed) st |= ST_ARMED; if (motors_running) st |= ST_MOTORS_RUN;
     if (cal_busy) st |= ST_CAL_BUSY; if (imu_enable) st |= ST_IMU_EN; if (failsafe_active) st |= ST_FAILSAFE;
 
-    buf_u8 (buf, &o, PKT_TELEM); buf_u8 (buf, &o, tx_seq++); buf_u32(buf, &o, now_ms);                                          
+    buf_u8 (buf, &o, PKT_TELEM); buf_u8 (buf, &o, tx_seq++); buf_u32(buf, &o, now_ms);                                        
     buf_u16(buf, &o, (uint16_t)clamp_i16((int32_t)(roll_deg  * 10.0f))); buf_u16(buf, &o, (uint16_t)clamp_i16((int32_t)(pitch_deg * 10.0f))); 
     buf_u16(buf, &o, (uint16_t)clamp_i16((int32_t)(gx_f * 10.0f))); buf_u16(buf, &o, (uint16_t)clamp_i16((int32_t)(gy_f * 10.0f)));      
     buf_u16(buf, &o, (uint16_t)clamp_i16((int32_t)(gz_f * 10.0f))); buf_u16(buf, &o, st);                                              
@@ -510,7 +540,7 @@ static void build_send_telem(uint32_t now_ms) {
 int main(void) {
     HAL_Init(); SystemClock_Config();
     MX_GPIO_Init(); MX_I2C1_Init(); MX_SPI1_Init(); MX_TIM1_Init(); MX_TIM2_Init(); MX_USART2_UART_Init();
-    HAL_Delay(200); uart_print("BOOT V9.4.1 - CON LED ARM\r\n");
+    HAL_Delay(200); uart_print("BOOT V9.5 - 4-MODE MULTIPLEXER\r\n");
     motors_start(); disarm_now(0); last_cmd_ms = HAL_GetTick();
     if (MPU9250_Init(&hi2c1, &mpu) != MPU_OK) { uart_print("MPU FAIL\r\n"); while (1) HAL_Delay(1000); }
     nrf.ce_port = GPIOB; nrf.ce_pin = GPIO_PIN_0; nrf.csn_port = GPIOB; nrf.csn_pin = GPIO_PIN_1;
@@ -530,14 +560,12 @@ int main(void) {
         }
         cal_step(now);
 
-        // --- GESTOR DE PARPADEO DEL LED PC13 ---
         if (arm_blink_count > 0 && now >= next_blink_ms) {
             HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
             next_blink_ms = now + 100;
             arm_blink_count--;
             
             if (arm_blink_count == 0) {
-                // Forzar apagado al terminar la ráfaga (PC13 suele ser activo bajo, SET = OFF)
                 HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET); 
             }
         }
@@ -613,12 +641,10 @@ static void MX_USART2_UART_Init(void) {
 static void MX_GPIO_Init(void) {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
     
-    // Habilitar los relojes para los puertos A, B y C (PC13 para el LED)
     __HAL_RCC_GPIOA_CLK_ENABLE(); 
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE(); 
 
-    // Inicialización del LED en PC13 (Apagado por defecto - Activo bajo)
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET); 
     GPIO_InitStruct.Pin = GPIO_PIN_13;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -626,7 +652,6 @@ static void MX_GPIO_Init(void) {
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-    // Inicialización de NRF (Mantenido intacto)
     HAL_GPIO_WritePin(CE_GPIO_Port, CE_Pin, GPIO_PIN_RESET); 
     HAL_GPIO_WritePin(CSN_GPIO_Port, CSN_Pin, GPIO_PIN_SET);
     GPIO_InitStruct.Pin = CE_Pin | CSN_Pin; 
