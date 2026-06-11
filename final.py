@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Horus GCS V9.2 — LQI / LQG / FUZZY Multiplexor
-(Bug de desbordamiento corregido, variables empaquetadas a x10)
+Horus GCS V9.5 — 4-MODE Multiplexor (LQI / LQG / FUZZY / PID)
+(Añadido Controlador PID Clásico multiplexado en payload)
 """
 
 import time, struct, threading
@@ -48,6 +48,7 @@ CMD_START_MOTORS  = 1 << 7
 CMD_UPDATE_K      = 1 << 8
 CMD_SET_AW        = 1 << 9  
 CMD_UPDATE_FUZZY  = 1 << 10 
+CMD_UPDATE_PID    = 1 << 11 # <--- NUEVA BANDERA PID
 
 # ── Bits de status ───────────────────────────────────────────────
 ST_MPU_OK     = 1 << 0
@@ -141,6 +142,10 @@ class CmdState:
         self.fz_e_max   = 30.0
         self.fz_r_max   = 200.0
         self.fz_out_max = 300.0
+
+        # --- Variables del PID [Kp, Ki, Kd] ---
+        self.pid_roll  = [1.2, 0.1, 0.05]
+        self.pid_pitch = [1.2, 0.1, 0.05]
         
         self.aw_limit  = 65        
         self.imu_en = 1
@@ -149,22 +154,33 @@ class CmdState:
 
     def pack(self):
         with self._lock:
-            # CORRECCIÓN DE DESBORDAMIENTO
+            # MULTIPLEXACIÓN DE VARIABLES: Aprovechamos los mismos 6 espacios de bytes
             if self.flags & CMD_UPDATE_FUZZY:
-                # Usamos _i16_x10 para que valores como 300 se envíen como 3000 (cabe en int16_t sin problema)
-                kr_a_encoded = _i16_x10(self.fz_e_max)
-                kr_r_encoded = _i16_x10(self.fz_r_max)
-                kr_i_encoded = _i16_x10(self.fz_out_max)
+                kr_a = _i16_x10(self.fz_e_max)
+                kr_r = _i16_x10(self.fz_r_max)
+                kr_i = _i16_x10(self.fz_out_max)
+                kp_a = _i16_x1000(self.k_pitch_ang)
+                kp_r = _i16_x1000(self.k_pitch_rate)
+                kp_i = _i16_x1000(self.k_pitch_int)
+            elif self.flags & CMD_UPDATE_PID:
+                kr_a = _i16_x1000(self.pid_roll[0]) # Kp -> ang
+                kr_r = _i16_x1000(self.pid_roll[2]) # Kd -> rate
+                kr_i = _i16_x1000(self.pid_roll[1]) # Ki -> int
+                kp_a = _i16_x1000(self.pid_pitch[0])
+                kp_r = _i16_x1000(self.pid_pitch[2])
+                kp_i = _i16_x1000(self.pid_pitch[1])
             else:
-                kr_a_encoded = _i16_x1000(self.k_roll_ang)
-                kr_r_encoded = _i16_x1000(self.k_roll_rate)
-                kr_i_encoded = _i16_x1000(self.k_roll_int)
+                kr_a = _i16_x1000(self.k_roll_ang)
+                kr_r = _i16_x1000(self.k_roll_rate)
+                kr_i = _i16_x1000(self.k_roll_int)
+                kp_a = _i16_x1000(self.k_pitch_ang)
+                kp_r = _i16_x1000(self.k_pitch_rate)
+                kp_i = _i16_x1000(self.k_pitch_int)
 
             return CMD_FMT.pack(
                 PKT_CMD, self.seq & 0xFF, self.flags & 0xFFFF, int(self.thr_us) & 0xFFFF,
                 _i16_x10(self.sp_roll), _i16_x10(self.sp_pitch),
-                kr_a_encoded, kr_r_encoded, kr_i_encoded,    
-                _i16_x1000(self.k_pitch_ang), _i16_x1000(self.k_pitch_rate), _i16_x1000(self.k_pitch_int),   
+                kr_a, kr_r, kr_i, kp_a, kp_r, kp_i,   
                 int(self.aw_limit) & 0xFFFF, self.imu_en & 0xFF, self.ping_id & 0xFF, self.ctrl_mode & 0xFF
             )
 
@@ -289,7 +305,7 @@ class HorusGCS:
         age = int((time.time() - last_rx) * 1000)
         st = decode_status(telem["status"])
         link = "🟢" if age < 500 else "🔴"
-        mod_str = ["LQI (Compl)", "LQG (Kalman)", "FUZZY (Difuso)"][self.cmd.ctrl_mode]
+        mod_str = ["LQI (Compl)", "LQG (Kalman)", "FUZZY (Difuso)", "PID (Clásico)"][self.cmd.ctrl_mode]
         
         print(f"[{link} {age}ms] MODO: {mod_str}")
         print(f"        Roll= {telem['roll']:+6.1f}° SP={self.cmd.sp_roll:+4.1f}° | Pitch= {telem['pitch']:+6.1f}° SP={self.cmd.sp_pitch:+4.1f}°")
@@ -309,6 +325,10 @@ class HorusGCS:
 
         if self.cmd.ctrl_mode == 2:
             print(f"        [FUZZY] Límites Activos -> Err_Max: {self.cmd.fz_e_max}° | Rate_Max: {self.cmd.fz_r_max}°/s | Out_Max: {self.cmd.fz_out_max}")
+
+        if self.cmd.ctrl_mode == 3:
+            print(f"        [PID] Roll : Kp={self.cmd.pid_roll[0]:.3f} Ki={self.cmd.pid_roll[1]:.3f} Kd={self.cmd.pid_roll[2]:.3f}")
+            print(f"        [PID] Pitch: Kp={self.cmd.pid_pitch[0]:.3f} Ki={self.cmd.pid_pitch[1]:.3f} Kd={self.cmd.pid_pitch[2]:.3f}")
 
         print(f"        Arm={st['armed']} Motors={st['motors']} AW={self.cmd.aw_limit} FS={st['fs']}")
 
@@ -337,36 +357,45 @@ class HorusGCS:
                 elif cmd == "help" or cmd == "?":
                     print("""
 ╔══════════════════════════════════════════════════════════╗
-║     Horus GCS V9.2 — LQI / LQG / FUZZY Multiplexer       ║
+║    Horus GCS V9.5 — 4-MODE Multiplexer                   ║
 ╠══════════════════════════════════════════════════════════╣
 ║ MODO DE CONTROL (Cambio en vivo):                        ║
 ║   mode lqi         LQI clásico                           ║
 ║   mode lqg         LQI + Filtro de Kalman                ║
 ║   mode fuzzy       Motor de Inferencia Difuso (25 Reglas)║
+║   mode pid         PID Clásico                           ║
 ║                                                          ║
-║ TUNING FUZZY (Moldea la superficie de control):          ║
+║ TUNING:                                                  ║
 ║   tune fuzzy <E_max> <Rate_max> <Out_PWM>                ║
-║     Ej: tune fuzzy 30 200 300                            ║
+║   tune pid roll|pitch <Kp> <Ki> <Kd>                     ║
+║   tune roll|pitch <Q_ang> <Q_rate> <Q_int> <R>           ║
+║   kalman roll|pitch <Qw_pos> <Qw_vel> <Rv_pos> <Rv_vel>  ║
 ║                                                          ║
 ║ Vuelo y Comandos base:                                   ║
 ║   cal, arm, dis, stop, start, status, thr <us>           ║
 ║   aw <valor>, roll <°>, pitch <°>                        ║
-║                                                          ║
-║ Tuning LQI y LQG:                                        ║
-║   tune roll|pitch <Q_ang> <Q_rate> <Q_int> <R>           ║
-║   kalman roll|pitch <Qw_pos> <Qw_vel> <Rv_pos> <Rv_vel>  ║
 ╚══════════════════════════════════════════════════════════╝""")
                 elif cmd == "mode" and len(args) == 1:
                     m = args[0].lower()
                     if m == "lqi": ok = self._send(ctrl_mode=0); print("🧠 Modo LQI Activado" if ok else "❌ Sin ACK")
                     elif m == "lqg": ok = self._send(ctrl_mode=1); print("🧠 Modo LQG Activado" if ok else "❌ Sin ACK")
                     elif m == "fuzzy": ok = self._send(ctrl_mode=2); print("🧠 Modo FUZZY Activado" if ok else "❌ Sin ACK")
+                    elif m == "pid": ok = self._send(ctrl_mode=3); print("🧠 Modo PID Clásico Activado" if ok else "❌ Sin ACK")
                 
                 elif cmd == "tune" and len(args) == 4 and args[0].lower() == "fuzzy":
                     e_max, r_max, out_max = map(float, args[1:4])
                     self.cmd.set(fz_e_max=e_max, fz_r_max=r_max, fz_out_max=out_max)
                     ok = self._send(flags=CMD_UPDATE_FUZZY)
                     print(f"✅ Límites Fuzzy Actualizados a -> E:{e_max}°, R:{r_max}°/s, Out:{out_max}" if ok else "❌ Sin ACK")
+
+                elif cmd == "tune" and len(args) == 5 and args[0].lower() == "pid":
+                    axis = args[1].lower()
+                    if axis in ["roll", "pitch"]:
+                        kp, ki, kd = map(float, args[2:5])
+                        if axis == "roll": self.cmd.set(pid_roll=[kp, ki, kd])
+                        else: self.cmd.set(pid_pitch=[kp, ki, kd])
+                        ok = self._send(flags=CMD_UPDATE_PID)
+                        print(f"✅ PID {axis.upper()} Actualizado -> Kp:{kp} Ki:{ki} Kd:{kd}" if ok else "❌ Sin ACK")
 
                 elif cmd == "cal": ok = self._send(flags=CMD_CAL_ALL); print("✅ Calibración iniciada" if ok else "❌ Err")
                 elif cmd == "arm": 
@@ -378,7 +407,7 @@ class HorusGCS:
                 elif cmd == "roll" and len(args) == 1: self._send(sp_roll=float(args[0])); print(f"✅ SP Roll -> {args[0]}")
                 elif cmd == "pitch" and len(args) == 1: self._send(sp_pitch=float(args[0])); print(f"✅ SP Pitch -> {args[0]}")
                 elif cmd == "aw" and len(args) == 1: self._send(flags=CMD_SET_AW, aw_limit=int(args[0])); print(f"✅ AW -> {args[0]}")
-                elif cmd == "tune" and len(args) == 5:
+                elif cmd == "tune" and len(args) == 5 and args[0].lower() not in ["fuzzy", "pid"]:
                     axis = args[0].lower()
                     if axis in ["roll", "pitch"]: self._tune_lqi(axis, *map(float, args[1:5]))
                 elif cmd == "kalman" and len(args) == 5:
@@ -402,7 +431,7 @@ class HorusGCS:
             ax.tick_params(colors="#cccccc")
             ax.grid(True, color="#222244", linestyle="--", linewidth=0.5)
 
-        fig.suptitle("Horus GCS V9.2 — Roll & Pitch", color="#e0e0ff", fontsize=13)
+        fig.suptitle("Horus GCS V9.5 — Roll & Pitch", color="#e0e0ff", fontsize=13)
         ln_roll,    = ax1.plot([], [], color="#4fc3f7", lw=1.5, label="Roll")
         ln_sp_roll, = ax1.plot([], [], color="#ef5350", lw=1.0, ls="--", label="SP Roll")
         ax1.set_ylim(-60, 60); ax1.legend(loc="upper right", facecolor="#111133", labelcolor="white", fontsize=8)
@@ -426,7 +455,7 @@ class HorusGCS:
         self.stop_evt.set()
 
     def run(self):
-        print("=== Horus GCS V9.2 - Fuzzy Logic y UI Restaurada ===")
+        print("=== Horus GCS V9.5 - 4-MODE MULTIPLEXER ===")
         if not self._init_radio(): return
         self.radio.writeAckPayload(1, self.cmd.pack())
         threading.Thread(target=self._rx_thread, daemon=True).start()
@@ -438,3 +467,4 @@ class HorusGCS:
 
 if __name__ == "__main__":
     HorusGCS().run()
+    
