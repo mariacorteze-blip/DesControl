@@ -1,13 +1,14 @@
 /* USER CODE BEGIN Header */
 /**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : STM32 LQI/LQG/FUZZY Multiplexer - V9.2
-  *
-  * - ERROR DE SIGNO CORREGIDO: Fuzzy ahora usa retroalimentación negativa (-).
-  * - DESBORDAMIENTO CORREGIDO: Límites Fuzzy desempaquetados a /10.0f.
-  ******************************************************************************
-  */
+ ******************************************************************************
+ * @file           : main.c
+ * @brief          : STM32 LQI/LQG/FUZZY Multiplexer - V9.4.1 (Con LED de Armado)
+ *
+ * - ERROR DE SIGNO CORREGIDO: Fuzzy usa retroalimentación negativa (-).
+ * - DESBORDAMIENTO CORREGIDO: Límites Fuzzy desempaquetados a /10.0f.
+ * - INDICADOR VISUAL: LED en PC13 parpadea 3 veces al armar (No bloqueante).
+ ******************************************************************************
+ */
 /* USER CODE END Header */
 
 #include "main.h"
@@ -53,6 +54,10 @@ static int32_t  axs=0, ays=0, azs=0;
 static uint32_t cal_next_ms        = 0;
 static const uint32_t CAL_SAMPLE_PERIOD_MS = 5;
 static uint32_t next_hb_ms         = 0;
+
+// Variables para el parpadeo del LED
+static uint8_t  arm_blink_count = 0;
+static uint32_t next_blink_ms   = 0;
 
 #define PKT_TELEM   0xA1
 #define PKT_CMD     0xB1
@@ -385,7 +390,6 @@ static void control_update(void) {
         u_pitch = -(K_pitch_ang * e_pitch + K_pitch_rate * final_gy + K_pitch_int * int_e_pitch);
     }
     else if (current_ctrl_mode == 2) {
-        // !!! CORRECCIÓN DEL SIGNO (Retroalimentación Negativa) !!!
         u_roll  = -compute_fuzzy(e_roll, final_gx);
         u_pitch = -compute_fuzzy(e_pitch, final_gy);
     }
@@ -421,7 +425,6 @@ static void handle_cmd(const CmdPkt *c) {
     target_pitch = (float)c->sp_pitch_x10 / 10.0f;
 
     if (c->flags & CMD_UPDATE_FUZZY) {
-        // !!! CORRECCIÓN DE DESBORDAMIENTO: Division entre 10 en lugar de 1000 !!!
         fz_e_max   = (float)c->k_roll_ang_x1000   / 10.0f;
         fz_r_max   = (float)c->k_roll_rate_x1000  / 10.0f;
         fz_out_max = (float)c->k_roll_int_x1000   / 10.0f;
@@ -450,6 +453,10 @@ static void handle_cmd(const CmdPkt *c) {
         if (!failsafe_active) {
             armed = 1; motors_running = 0; int_e_roll = 0.0f; int_e_pitch = 0.0f;
             motors_write_all(1000); uart_print("ARMED\r\n");
+            
+            // Iniciar ráfaga de parpadeo del LED
+            arm_blink_count = 6; 
+            next_blink_ms = HAL_GetTick();
         }
     }
 
@@ -470,10 +477,10 @@ static void build_send_telem(uint32_t now_ms) {
     if (armed) st |= ST_ARMED; if (motors_running) st |= ST_MOTORS_RUN;
     if (cal_busy) st |= ST_CAL_BUSY; if (imu_enable) st |= ST_IMU_EN; if (failsafe_active) st |= ST_FAILSAFE;
 
-    buf_u8 (buf, &o, PKT_TELEM); buf_u8 (buf, &o, tx_seq++); buf_u32(buf, &o, now_ms);                                           
+    buf_u8 (buf, &o, PKT_TELEM); buf_u8 (buf, &o, tx_seq++); buf_u32(buf, &o, now_ms);                                          
     buf_u16(buf, &o, (uint16_t)clamp_i16((int32_t)(roll_deg  * 10.0f))); buf_u16(buf, &o, (uint16_t)clamp_i16((int32_t)(pitch_deg * 10.0f))); 
     buf_u16(buf, &o, (uint16_t)clamp_i16((int32_t)(gx_f * 10.0f))); buf_u16(buf, &o, (uint16_t)clamp_i16((int32_t)(gy_f * 10.0f)));      
-    buf_u16(buf, &o, (uint16_t)clamp_i16((int32_t)(gz_f * 10.0f))); buf_u16(buf, &o, st);                                               
+    buf_u16(buf, &o, (uint16_t)clamp_i16((int32_t)(gz_f * 10.0f))); buf_u16(buf, &o, st);                                              
     buf_u16(buf, &o, (uint16_t)__HAL_TIM_GET_COMPARE(&htim1, TIM_CHANNEL_1)); buf_u16(buf, &o, (uint16_t)__HAL_TIM_GET_COMPARE(&htim1, TIM_CHANNEL_2)); 
     buf_u16(buf, &o, (uint16_t)__HAL_TIM_GET_COMPARE(&htim1, TIM_CHANNEL_3)); buf_u16(buf, &o, (uint16_t)__HAL_TIM_GET_COMPARE(&htim1, TIM_CHANNEL_4)); 
     buf_u8 (buf, &o, cmd_echo); buf_u8 (buf, &o, ping_echo);                                        
@@ -503,7 +510,7 @@ static void build_send_telem(uint32_t now_ms) {
 int main(void) {
     HAL_Init(); SystemClock_Config();
     MX_GPIO_Init(); MX_I2C1_Init(); MX_SPI1_Init(); MX_TIM1_Init(); MX_TIM2_Init(); MX_USART2_UART_Init();
-    HAL_Delay(200); uart_print("BOOT V9.2 - BUG DE FUZZY CORREGIDO\r\n");
+    HAL_Delay(200); uart_print("BOOT V9.4.1 - CON LED ARM\r\n");
     motors_start(); disarm_now(0); last_cmd_ms = HAL_GetTick();
     if (MPU9250_Init(&hi2c1, &mpu) != MPU_OK) { uart_print("MPU FAIL\r\n"); while (1) HAL_Delay(1000); }
     nrf.ce_port = GPIOB; nrf.ce_pin = GPIO_PIN_0; nrf.csn_port = GPIOB; nrf.csn_pin = GPIO_PIN_1;
@@ -522,6 +529,19 @@ int main(void) {
             }
         }
         cal_step(now);
+
+        // --- GESTOR DE PARPADEO DEL LED PC13 ---
+        if (arm_blink_count > 0 && now >= next_blink_ms) {
+            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+            next_blink_ms = now + 100;
+            arm_blink_count--;
+            
+            if (arm_blink_count == 0) {
+                // Forzar apagado al terminar la ráfaga (PC13 suele ser activo bajo, SET = OFF)
+                HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET); 
+            }
+        }
+
         if (cmd_echo != 0 && (now - last_cmd_ms) > FAILSAFE_MS) { if (!failsafe_active) disarm_now(1); }
         if ((int32_t)(now - next_hb_ms) >= 0) { next_hb_ms += HB_PERIOD_MS; build_send_telem(now); }
     }
@@ -592,10 +612,27 @@ static void MX_USART2_UART_Init(void) {
 }
 static void MX_GPIO_Init(void) {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
-    __HAL_RCC_GPIOA_CLK_ENABLE(); __HAL_RCC_GPIOB_CLK_ENABLE();
-    HAL_GPIO_WritePin(CE_GPIO_Port, CE_Pin, GPIO_PIN_RESET); HAL_GPIO_WritePin(CSN_GPIO_Port, CSN_Pin, GPIO_PIN_SET);
-    GPIO_InitStruct.Pin = CE_Pin | CSN_Pin; GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL; GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    
+    // Habilitar los relojes para los puertos A, B y C (PC13 para el LED)
+    __HAL_RCC_GPIOA_CLK_ENABLE(); 
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE(); 
+
+    // Inicialización del LED en PC13 (Apagado por defecto - Activo bajo)
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET); 
+    GPIO_InitStruct.Pin = GPIO_PIN_13;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+    // Inicialización de NRF (Mantenido intacto)
+    HAL_GPIO_WritePin(CE_GPIO_Port, CE_Pin, GPIO_PIN_RESET); 
+    HAL_GPIO_WritePin(CSN_GPIO_Port, CSN_Pin, GPIO_PIN_SET);
+    GPIO_InitStruct.Pin = CE_Pin | CSN_Pin; 
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL; 
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 }
 void Error_Handler(void) { __disable_irq(); while (1) {} }
